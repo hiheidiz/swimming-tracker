@@ -11,8 +11,6 @@ Features:
 - Enhanced line tracking with blue channel optimization
 - Compute distance from each point to reference line
 - Custom 3-point smoothing: 1/4 previous + 1/2 current + 1/4 next position
-- Combined velocity and acceleration graphs showing all points together
-- X and Y position graphs for each point
 - Comprehensive CSV output with all data
 
 Usage:
@@ -23,7 +21,6 @@ import cv2
 import numpy as np
 import argparse
 import pandas as pd
-import matplotlib.pyplot as plt
 import csv
 from scipy.ndimage import median_filter
 
@@ -392,7 +389,7 @@ def compute_derivative(times, values):
     return deriv
 
 
-def process_video_multitrack(video_path, out_csv=None, plot=True, 
+def process_video_multitrack(video_path, out_csv=None, 
                              interpolate_max_gap=0.25, smoothing_iterations=3):
     """
     Process video with multi-swimmer tracking and line tracking.
@@ -605,7 +602,65 @@ def process_video_multitrack(video_path, out_csv=None, plot=True,
     # Process each tracked point
     print(f"\n[INFO] Processing {len(swimmer_data)} tracked points...")
     
-    # Build dataframe
+    # Build dataframe in long format: Frame, ObjectID, X, Y, X_smooth, Y_smooth
+    csv_rows = []
+    
+    for obj_id in sorted(swimmer_data.keys()):
+        data = swimmer_data[obj_id]
+        start_frame = data['start_frame']
+        print(f"  Point {obj_id}: {len(data['x'])} frames (started at frame {start_frame})")
+        
+        # Pad arrays to match frame count, starting from start_frame
+        swimmer_x = np.full(frame_idx, np.nan)
+        swimmer_y = np.full(frame_idx, np.nan)
+        
+        for i in range(len(data['x'])):
+            frame_num = start_frame + i
+            if frame_num < frame_idx:
+                swimmer_x[frame_num] = data['x'][i]
+                swimmer_y[frame_num] = data['y'][i]
+        
+        # Interpolate short gaps
+        swimmer_y_interp = linear_interpolate_positions(times, swimmer_y, max_gap_seconds=interpolate_max_gap)
+        swimmer_x_interp = linear_interpolate_positions(times, swimmer_x, max_gap_seconds=interpolate_max_gap)
+        
+        # Apply AGGRESSIVE smoothing to the interpolated point position
+        print(f"[INFO] Applying aggressive smoothing to point {obj_id} positions...")
+        swimmer_y_smooth = aggressive_smooth(swimmer_y_interp, gaussian_window=41, moving_avg_window=21)
+        swimmer_x_smooth = aggressive_smooth(swimmer_x_interp, gaussian_window=41, moving_avg_window=21)
+        
+        # Apply 3-point smoothing
+        for iteration in range(smoothing_iterations):
+            swimmer_y_smooth = three_point_smooth(swimmer_y_smooth)
+            swimmer_x_smooth = three_point_smooth(swimmer_x_smooth)
+        
+        print(f"[INFO] Applied 3-point smoothing ({smoothing_iterations} iterations) to point {obj_id}")
+        
+        # Build rows for this object (include all frames from start_frame onwards)
+        for frame_num in range(start_frame, frame_idx):
+            x_val = swimmer_x[frame_num]
+            y_val = swimmer_y[frame_num]
+            x_smooth_val = swimmer_x_smooth[frame_num]
+            y_smooth_val = swimmer_y_smooth[frame_num]
+            
+            # Add row with data (empty string for NaN values)
+            csv_rows.append({
+                'Frame': frame_num,
+                'ObjectID': obj_id,
+                'X': x_val if not np.isnan(x_val) else '',
+                'Y': y_val if not np.isnan(y_val) else '',
+                'X_smooth': x_smooth_val if not np.isnan(x_smooth_val) else '',
+                'Y_smooth': y_smooth_val if not np.isnan(y_smooth_val) else ''
+            })
+    
+    # Create DataFrame from rows and sort by ObjectID, Frame
+    df = pd.DataFrame(csv_rows)
+    if len(df) > 0:
+        df = df.sort_values(['ObjectID', 'Frame']).reset_index(drop=True)
+        # Ensure column order: Frame, ObjectID, X, Y, X_smooth, Y_smooth
+        df = df[['Frame', 'ObjectID', 'X', 'Y', 'X_smooth', 'Y_smooth']]
+    
+    # For statistics, keep internal wide format for calculations
     all_data = {
         "time_s": times,
         "line_x_raw": line_x_list,
@@ -617,7 +672,6 @@ def process_video_multitrack(video_path, out_csv=None, plot=True,
     for obj_id in sorted(swimmer_data.keys()):
         data = swimmer_data[obj_id]
         start_frame = data['start_frame']
-        print(f"  Point {obj_id}: {len(data['x'])} frames (started at frame {start_frame})")
         
         # Pad arrays to match frame count, starting from start_frame
         swimmer_x = np.full(frame_idx, np.nan)
@@ -647,7 +701,6 @@ def process_video_multitrack(video_path, out_csv=None, plot=True,
         swimmer_y_interp = linear_interpolate_positions(times, swimmer_y, max_gap_seconds=interpolate_max_gap)
         
         # Apply AGGRESSIVE smoothing to the interpolated point position
-        print(f"[INFO] Applying aggressive smoothing to point {obj_id} positions...")
         rel_x_sm = aggressive_smooth(rel_x_interp, gaussian_window=41, moving_avg_window=21)
         swimmer_y_smooth = aggressive_smooth(swimmer_y_interp, gaussian_window=41, moving_avg_window=21)
         swimmer_x_smooth = aggressive_smooth(linear_interpolate_positions(times, swimmer_x, max_gap_seconds=interpolate_max_gap), 
@@ -659,13 +712,11 @@ def process_video_multitrack(video_path, out_csv=None, plot=True,
             swimmer_y_smooth = three_point_smooth(swimmer_y_smooth)
             swimmer_x_smooth = three_point_smooth(swimmer_x_smooth)
         
-        print(f"[INFO] Applied 3-point smoothing ({smoothing_iterations} iterations) to point {obj_id}")
-        
-        # Compute velocity and acceleration
+        # Compute velocity and acceleration for statistics
         vx = compute_derivative(times, rel_x_sm)
         ax = compute_derivative(times, vx)
         
-        # Add to dataframe
+        # Add to dataframe for statistics
         all_data[f"point_{obj_id}_x"] = swimmer_x
         all_data[f"point_{obj_id}_y"] = swimmer_y
         all_data[f"point_{obj_id}_x_smooth"] = swimmer_x_smooth
@@ -677,19 +728,19 @@ def process_video_multitrack(video_path, out_csv=None, plot=True,
         all_data[f"point_{obj_id}_v_x_px_s"] = vx
         all_data[f"point_{obj_id}_a_x_px_s2"] = ax
     
-    df = pd.DataFrame(all_data)
+    df_stats = pd.DataFrame(all_data)
     
     if out_csv:
         df.to_csv(out_csv, index=False)
         print(f"[INFO] Results written to {out_csv}")
     
-    # Print statistics for each tracked point
+    # Print statistics for each tracked point (using df_stats for calculations)
     for obj_id in sorted(swimmer_data.keys()):
-        point_x = df[f"point_{obj_id}_x"].values
+        point_x = df_stats[f"point_{obj_id}_x"].values
         valid_point = point_x[~np.isnan(point_x)]
         
-        rel_x_sm = df[f"point_{obj_id}_rel_x_smooth_px"].values
-        vx = df[f"point_{obj_id}_v_x_px_s"].values
+        rel_x_sm = df_stats[f"point_{obj_id}_rel_x_smooth_px"].values
+        vx = df_stats[f"point_{obj_id}_v_x_px_s"].values
         
         valid_rel_x = rel_x_sm[~np.isnan(rel_x_sm)]
         valid_vx = vx[~np.isnan(vx)]
@@ -718,115 +769,6 @@ def process_video_multitrack(video_path, out_csv=None, plot=True,
             print(f"    Min: {np.min(valid_vx):.2f} px/s")
             print(f"    Max: {np.max(valid_vx):.2f} px/s")
     
-    if plot and len(swimmer_data) > 0:
-        n_points = len(swimmer_data)
-        fig, axes = plt.subplots(3, 2, figsize=(16, 12), sharex=True)
-        
-        fig.suptitle('Multi-Point Tracking Analysis (Body Parts)', fontsize=16, weight='bold')
-        
-        # Generate colors for each point
-        colors = plt.cm.tab10(np.linspace(0, 1, n_points))
-        
-        # Row 0: Line position and All Points Position Comparison
-        axes[0, 0].plot(times, df['line_x'], '-', linewidth=2, label='Line Position (smoothed)', color='red')
-        axes[0, 0].axhline(y=ref_line_x, color='red', linestyle='--', alpha=0.5, 
-                          label=f'Median: {ref_line_x:.1f}px')
-        axes[0, 0].set_ylabel('Line Position (px)', fontsize=12)
-        axes[0, 0].set_title('Reference Line Tracking', fontsize=14, fontweight='bold')
-        axes[0, 0].legend()
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # All Points Position Comparison (X positions)
-        for idx, obj_id in enumerate(sorted(swimmer_data.keys())):
-            start_frame = swimmer_data[obj_id]['start_frame']
-            start_time = start_frame / fps
-            color = colors[idx]
-            
-            axes[0, 1].plot(times, df[f'point_{obj_id}_x_smooth'], 
-                           label=f'Point {obj_id}', color=color, linewidth=2)
-            axes[0, 1].axvline(x=start_time, color=color, linestyle=':', alpha=0.3, linewidth=1)
-        
-        axes[0, 1].set_ylabel('X Position (px)', fontsize=12)
-        axes[0, 1].set_title('All Points - Position Comparison', fontsize=14, fontweight='bold')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Row 1: Distance from line comparison and Y position comparison
-        for idx, obj_id in enumerate(sorted(swimmer_data.keys())):
-            start_frame = swimmer_data[obj_id]['start_frame']
-            start_time = start_frame / fps
-            color = colors[idx]
-            
-            axes[1, 0].plot(times, df[f'point_{obj_id}_rel_x_smooth_px'], 
-                           label=f'Point {obj_id}', color=color, linewidth=2)
-            axes[1, 0].axvline(x=start_time, color=color, linestyle=':', alpha=0.3, linewidth=1)
-        
-        axes[1, 0].axhline(y=0, color='k', linestyle='--', alpha=0.5)
-        axes[1, 0].set_ylabel('Distance from Line (px)', fontsize=12)
-        axes[1, 0].set_title('All Points - Distance from Line Comparison', fontsize=14, fontweight='bold')
-        axes[1, 0].legend()
-        axes[1, 0].grid(True, alpha=0.3)
-        
-        # Y position comparison
-        for idx, obj_id in enumerate(sorted(swimmer_data.keys())):
-            start_frame = swimmer_data[obj_id]['start_frame']
-            start_time = start_frame / fps
-            color = colors[idx]
-            
-            axes[1, 1].plot(times, df[f'point_{obj_id}_y_smooth'], 
-                           label=f'Point {obj_id}', color=color, linewidth=2)
-            axes[1, 1].axvline(x=start_time, color=color, linestyle=':', alpha=0.3, linewidth=1)
-        
-        axes[1, 1].set_ylabel('Y Position (px)', fontsize=12)
-        axes[1, 1].set_title('All Points - Y Position Comparison', fontsize=14, fontweight='bold')
-        axes[1, 1].legend()
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        # Row 2: X-direction Velocity comparison and Acceleration comparison
-        for idx, obj_id in enumerate(sorted(swimmer_data.keys())):
-            start_frame = swimmer_data[obj_id]['start_frame']
-            start_time = start_frame / fps
-            color = colors[idx]
-            
-            axes[2, 0].plot(times, df[f'point_{obj_id}_v_x_px_s'], 
-                           label=f'Point {obj_id}', color=color, linewidth=2)
-            axes[2, 0].axvline(x=start_time, color=color, linestyle=':', alpha=0.3, linewidth=1)
-        
-        axes[2, 0].axhline(y=0, color='k', linestyle='--', alpha=0.5)
-        axes[2, 0].set_xlabel('Time (s)', fontsize=12)
-        axes[2, 0].set_ylabel('X Velocity (px/s)', fontsize=12)
-        axes[2, 0].set_title('All Points - X-Direction Velocity Comparison', fontsize=14, fontweight='bold')
-        axes[2, 0].legend()
-        axes[2, 0].grid(True, alpha=0.3)
-        
-        # Acceleration comparison
-        for idx, obj_id in enumerate(sorted(swimmer_data.keys())):
-            start_frame = swimmer_data[obj_id]['start_frame']
-            start_time = start_frame / fps
-            color = colors[idx]
-            
-            axes[2, 1].plot(times, df[f'point_{obj_id}_a_x_px_s2'], 
-                           label=f'Point {obj_id}', color=color, linewidth=2)
-            axes[2, 1].axvline(x=start_time, color=color, linestyle=':', alpha=0.3, linewidth=1)
-        
-        axes[2, 1].axhline(y=0, color='k', linestyle='--', alpha=0.5)
-        axes[2, 1].set_xlabel('Time (s)', fontsize=12)
-        axes[2, 1].set_ylabel('X Acceleration (px/s²)', fontsize=12)
-        axes[2, 1].set_title('All Points - X-Direction Acceleration Comparison', fontsize=14, fontweight='bold')
-        axes[2, 1].legend()
-        axes[2, 1].grid(True, alpha=0.3)
-        
-        plt.tight_layout(rect=[0, 0.03, 1, 0.98])
-        
-        # Save plot
-        base = os.path.basename(video_path)
-        plot_name = f"analysis_{os.path.splitext(base)[0]}.png"
-        plot_path = os.path.join(os.path.dirname(video_path) if os.path.dirname(video_path) else '.', plot_name)
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        print(f"\n[INFO] Analysis plot saved to {plot_path}")
-        
-        plt.show()
-    
     print(f"\n{'='*70}")
     print("✅ PROCESSING COMPLETE!")
     print(f"{'='*70}")
@@ -849,14 +791,12 @@ Instructions:
   3. Press 'q' to finish and process results
   
 Note: Each "point" represents a different part of the swimmer's body (hand, shoulder, head, etc.)
-      All velocities are shown on combined graphs to compare movement of different body parts.
+      All tracking data is saved to CSV for analysis.
         """
     )
     parser.add_argument('--video', required=True, help='Path to input video file')
     parser.add_argument('--out', default='tracker_final_results.csv', 
                        help='CSV output path (default: tracker_final_results.csv)')
-    parser.add_argument('--no-plot', dest='plot', action='store_false', 
-                       help='Disable plotting')
     parser.add_argument('--smooth', type=int, default=3, 
                        help='Number of 3-point smoothing iterations (default: 3)')
     parser.add_argument('--interp-gap', type=float, default=0.25, 
@@ -871,7 +811,6 @@ Note: Each "point" represents a different part of the swimmer's body (hand, shou
     df = process_video_multitrack(
         args.video, 
         out_csv=args.out, 
-        plot=args.plot,
         interpolate_max_gap=args.interp_gap,
         smoothing_iterations=args.smooth
     )
