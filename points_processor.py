@@ -292,12 +292,8 @@ class PointsProcessor(QtWidgets.QMainWindow):
             return
         self.frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
 
-        # Get points for this frame from CSV data
-        draw_list = []
-        if self.frame_idx in self.points_by_frame:
-            draw_list = self.points_by_frame[self.frame_idx]
-
-        self.display_frame(frame, pnts=draw_list)
+        # Display frame without drawing points
+        self.display_frame(frame)
         self.frame_slider.setValue(self.frame_idx)
         self.frame_display.setText(f"Frame: {self.frame_idx} / {self.frame_count-1}")
 
@@ -306,13 +302,7 @@ class PointsProcessor(QtWidgets.QMainWindow):
         disp = frame.copy()
         if overlay_mask is not None:
             disp = cv2.add(disp, overlay_mask)
-        # draw tracked points as circles if provided
-        if pnts is not None:
-            for oid, (x,y) in pnts:
-                cv2.circle(disp, (int(x), int(y)), 5, (0,0,255), -1)
-                # Use custom name if available
-                obj_name = self.object_names.get(oid, f"Obj {oid}")
-                cv2.putText(disp, obj_name, (int(x)+6, int(y)-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        # Note: points are no longer drawn on the video display
         rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         # scale to label size keeping aspect
@@ -349,13 +339,8 @@ class PointsProcessor(QtWidgets.QMainWindow):
             self.play_btn.setText("Play")
             return
 
-        # Get points for this frame from CSV data
-        draw_list = []
-        if self.frame_idx in self.points_by_frame:
-            draw_list = self.points_by_frame[self.frame_idx]
-
-        # show frame + tracked points
-        self.display_frame(frame, pnts=draw_list)
+        # Display frame without drawing points
+        self.display_frame(frame)
 
         # advance internal counters
         self.frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
