@@ -52,6 +52,9 @@ class PointsProcessor(QtWidgets.QMainWindow):
         self.overlay_graph_type = "X_smooth"  # Current graph type to display
         self.overlay_visible_objects = set()  # Set of object IDs to show in overlay
 
+        # Track which objects have been prompted for names
+        self.objects_named = set()  # Set of object IDs that have been named
+
         # UI
         self.init_ui()
 
@@ -271,11 +274,14 @@ class PointsProcessor(QtWidgets.QMainWindow):
                     if name:
                         self.object_names[oid] = name
             else:
-                # Use default names
+                # Use default names (but don't mark as "named" yet - will prompt when they appear)
                 unique_oids = self.df_raw["ObjectID"].unique()
                 for oid in unique_oids:
                     if int(oid) not in self.object_names:
                         self.object_names[int(oid)] = f"Obj {int(oid)}"
+
+            # Reset named objects tracking - will prompt when objects first appear
+            self.objects_named = set()
 
             # Create checkboxes for objects
             self.create_object_checkboxes()
@@ -356,6 +362,9 @@ class PointsProcessor(QtWidgets.QMainWindow):
             return
         self.frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
 
+        # Check for new objects appearing at this frame
+        self.check_and_prompt_new_objects()
+
         # Display frame without drawing points
         self.display_frame(frame)
         self.frame_slider.setValue(self.frame_idx)
@@ -406,6 +415,9 @@ class PointsProcessor(QtWidgets.QMainWindow):
             self.play_btn.setText("Play")
             return
 
+        # Check for new objects appearing at this frame
+        self.check_and_prompt_new_objects()
+
         # Display frame without drawing points
         self.display_frame(frame)
 
@@ -416,6 +428,49 @@ class PointsProcessor(QtWidgets.QMainWindow):
 
         # Update overlay graph
         self.update_overlay_graph()
+
+    # --------------------------
+    # Object naming methods
+    # --------------------------
+    def check_and_prompt_new_objects(self):
+        """Check if any new objects appear at the current frame and prompt for names."""
+        if self.df_raw is None or self.frame_idx < 0:
+            return
+
+        # Get objects that appear at this frame
+        if self.frame_idx in self.points_by_frame:
+            objects_at_frame = {oid for oid, _ in self.points_by_frame[self.frame_idx]}
+
+            # Find objects that haven't been named yet
+            new_objects = objects_at_frame - self.objects_named
+
+            # Prompt for each new object
+            for oid in sorted(new_objects):
+                self.prompt_object_name(oid)
+                self.objects_named.add(oid)
+
+    def prompt_object_name(self, oid):
+        """Show popup dialog to name an object."""
+        default_name = self.object_names.get(oid, f"Object {oid}")
+        name, ok = QtWidgets.QInputDialog.getText(
+            self,
+            "Name Object",
+            f"Enter a name for object {oid}:",
+            QtWidgets.QLineEdit.Normal,
+            default_name
+        )
+
+        if ok and name.strip():
+            self.object_names[oid] = name.strip()
+        else:
+            # If user cancels or enters empty name, use default
+            self.object_names[oid] = f"Obj {oid}"
+
+        # Update checkboxes and graphs
+        self.create_object_checkboxes()
+        self.update_overlay_graph()
+        if self.df_proc is not None:
+            self.update_plots()
 
     # --------------------------
     # Overlay graph methods
@@ -574,12 +629,12 @@ class PointsProcessor(QtWidgets.QMainWindow):
             return
 
         plots = [
-            ("X_smooth", "Smoothed X Position (pixels)", "position_overlay.png"),
-            ("Velocity_smooth", "Smoothed Velocity (pixels/frame)", "velocity_overlay.png"),
-            ("Acceleration_smooth", "Smoothed Acceleration (pixels/frame^2)", "accel_overlay.png"),
+            ("X_smooth", "Smoothed X Position (pixels)"),
+            ("Velocity_smooth", "Smoothed Velocity (pixels/frame)"),
+            ("Acceleration_smooth", "Smoothed Acceleration (pixels/frame^2)")
         ]
 
-        for col, ylabel, fname in plots:
+        for col, ylabel in plots:
             if col not in self.plot_axes:
                 continue
             ax = self.plot_axes[col]
@@ -598,13 +653,9 @@ class PointsProcessor(QtWidgets.QMainWindow):
             ax.legend(loc="upper right", fontsize='x-small')
             fig.tight_layout()
 
-            # Save PNGs
-            fig.savefig(fname, dpi=200)
-            print(f"Saved figure to {fname}")
-
             # Rebind click event to seek video to nearest frame for this canvas
-            if fname in self.figures:
-                old_fig, old_cid = self.figures[fname]
+            if col in self.figures:
+                old_fig, old_cid = self.figures[col]
                 try:
                     old_fig.canvas.mpl_disconnect(old_cid)
                 except Exception:
@@ -636,7 +687,7 @@ class PointsProcessor(QtWidgets.QMainWindow):
                     self.show_frame_at(nearest_frame)
 
             cid = canvas.mpl_connect('button_press_event', on_click)
-            self.figures[fname] = (fig, cid)
+            self.figures[col] = (fig, cid)
 
             canvas.draw()
 
