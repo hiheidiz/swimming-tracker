@@ -620,36 +620,49 @@ def process_video_multitrack(video_path, out_csv=None,
                 swimmer_x[frame_num] = data['x'][i]
                 swimmer_y[frame_num] = data['y'][i]
         
+        # Compute relative position (signed distance from line)
+        rel_x = np.full_like(swimmer_x, np.nan)
+        last_known_line = None
+        for i in range(len(rel_x)):
+            lx = line_x_smooth[i] if i < len(line_x_smooth) and not np.isnan(line_x_smooth[i]) else last_known_line
+            if i < len(line_x_smooth) and not np.isnan(line_x_smooth[i]):
+                last_known_line = line_x_smooth[i]
+            if np.isnan(swimmer_x[i]) or lx is None or np.isnan(lx):
+                rel_x[i] = np.nan
+            else:
+                # Signed distance: positive when right of line, negative when left
+                rel_x[i] = swimmer_x[i] - lx
+        
         # Interpolate short gaps
         swimmer_y_interp = linear_interpolate_positions(times, swimmer_y, max_gap_seconds=interpolate_max_gap)
-        swimmer_x_interp = linear_interpolate_positions(times, swimmer_x, max_gap_seconds=interpolate_max_gap)
+        rel_x_interp = linear_interpolate_positions(times, rel_x, max_gap_seconds=interpolate_max_gap)
         
         # Apply AGGRESSIVE smoothing to the interpolated point position
         print(f"[INFO] Applying aggressive smoothing to point {obj_id} positions...")
         swimmer_y_smooth = aggressive_smooth(swimmer_y_interp, gaussian_window=41, moving_avg_window=21)
-        swimmer_x_smooth = aggressive_smooth(swimmer_x_interp, gaussian_window=41, moving_avg_window=21)
+        rel_x_smooth = aggressive_smooth(rel_x_interp, gaussian_window=41, moving_avg_window=21)
         
         # Apply 3-point smoothing
         for iteration in range(smoothing_iterations):
             swimmer_y_smooth = three_point_smooth(swimmer_y_smooth)
-            swimmer_x_smooth = three_point_smooth(swimmer_x_smooth)
+            rel_x_smooth = three_point_smooth(rel_x_smooth)
         
         print(f"[INFO] Applied 3-point smoothing ({smoothing_iterations} iterations) to point {obj_id}")
         
         # Build rows for this object (include all frames from start_frame onwards)
         for frame_num in range(start_frame, frame_idx):
-            x_val = swimmer_x[frame_num]
+            rel_x_val = rel_x[frame_num]  # Distance from line (raw)
             y_val = swimmer_y[frame_num]
-            x_smooth_val = swimmer_x_smooth[frame_num]
+            rel_x_smooth_val = rel_x_smooth[frame_num]  # Distance from line (smoothed)
             y_smooth_val = swimmer_y_smooth[frame_num]
             
             # Add row with data (empty string for NaN values)
             csv_rows.append({
                 'Frame': frame_num,
                 'ObjectID': obj_id,
-                'X': x_val if not np.isnan(x_val) else '',
+                'X': rel_x_val if not np.isnan(rel_x_val) else '',
                 'Y': y_val if not np.isnan(y_val) else '',
-                'X_smooth': x_smooth_val if not np.isnan(x_smooth_val) else '',
+                'X_smooth': rel_x_smooth_val if not np.isnan(rel_x_smooth_val) else '',
                 'Y_smooth': y_smooth_val if not np.isnan(y_smooth_val) else ''
             })
     
