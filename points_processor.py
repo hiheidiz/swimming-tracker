@@ -48,6 +48,10 @@ class PointsProcessor(QtWidgets.QMainWindow):
         self.points_by_frame = {}  # frame -> list of (object_id, x, y)
         self.object_names = {}  # mapping from object_id to custom name
 
+        # Overlay graph state
+        self.overlay_graph_type = "X_smooth"  # Current graph type to display
+        self.overlay_visible_objects = set()  # Set of object IDs to show in overlay
+
         # UI
         self.init_ui()
 
@@ -70,6 +74,21 @@ class PointsProcessor(QtWidgets.QMainWindow):
         self.play_btn.clicked.connect(self.toggle_play)
         row.addWidget(self.play_btn)
 
+        # Overlay graph controls
+        row.addWidget(QtWidgets.QLabel("Overlay Graph:"))
+        self.overlay_graph_combo = QtWidgets.QComboBox()
+        self.overlay_graph_combo.addItems(["Position", "Velocity", "Acceleration"])
+        self.overlay_graph_combo.currentIndexChanged.connect(self.on_overlay_graph_changed)
+        row.addWidget(self.overlay_graph_combo)
+
+        # Object checkboxes container
+        self.object_checkboxes_widget = QtWidgets.QWidget()
+        self.object_checkboxes_layout = QtWidgets.QHBoxLayout(self.object_checkboxes_widget)
+        self.object_checkboxes_layout.setContentsMargins(0, 0, 0, 0)
+        self.object_checkboxes_layout.addWidget(QtWidgets.QLabel("Objects:"))
+        self.object_checkboxes = {}  # object_id -> checkbox
+        row.addWidget(self.object_checkboxes_widget)
+
         self.status_label = QtWidgets.QLabel("No video or CSV loaded")
         row.addWidget(self.status_label)
         row.addStretch()
@@ -78,12 +97,46 @@ class PointsProcessor(QtWidgets.QMainWindow):
         # Central content: video on left, plots on right
         content_row = QtWidgets.QHBoxLayout()
 
-        # Video display (left)
+        # Video display (left) with overlay graph
+        video_widget = QtWidgets.QWidget()
+        video_widget.setFixedSize(960, 540)
+        video_layout_widget = QtWidgets.QVBoxLayout(video_widget)
+        video_layout_widget.setContentsMargins(0, 0, 0, 0)
+
         self.video_label = QtWidgets.QLabel()
         self.video_label.setFixedSize(960, 540)  # approximate; will scale frames into this label
         self.video_label.setStyleSheet("background-color: black;")
         self.video_label.setAlignment(QtCore.Qt.AlignCenter)
-        content_row.addWidget(self.video_label, stretch=2, alignment=QtCore.Qt.AlignLeft)
+        video_layout_widget.addWidget(self.video_label)
+
+        # Overlay graph on top of video
+        self.overlay_fig = Figure(figsize=(9.6, 5.4))
+        self.overlay_fig.patch.set_facecolor('none')
+        self.overlay_fig.patch.set_alpha(0.0)
+        self.overlay_ax = self.overlay_fig.add_subplot(111)
+        self.overlay_ax.set_facecolor('none')
+        self.overlay_ax.patch.set_alpha(0.0)
+        self.overlay_ax.spines['top'].set_visible(False)
+        self.overlay_ax.spines['right'].set_visible(False)
+        self.overlay_ax.spines['bottom'].set_color('white')
+        self.overlay_ax.spines['left'].set_color('white')
+        self.overlay_ax.tick_params(colors='white', labelsize=8)
+        self.overlay_ax.xaxis.label.set_color('white')
+        self.overlay_ax.yaxis.label.set_color('white')
+        self.overlay_ax.grid(True, linestyle='--', alpha=0.3, color='white')
+        self.overlay_fig.tight_layout(pad=0.5)
+
+        self.overlay_canvas = FigureCanvas(self.overlay_fig)
+        self.overlay_canvas.setParent(video_widget)
+        self.overlay_canvas.setFixedSize(960, 540)
+        self.overlay_canvas.setStyleSheet("background-color: transparent;")
+        self.overlay_canvas.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.overlay_canvas.raise_()
+
+        # Initially hide overlay (will show when CSV is loaded)
+        self.overlay_canvas.setVisible(False)
+
+        content_row.addWidget(video_widget, stretch=2, alignment=QtCore.Qt.AlignLeft)
 
         # Plots panel (right)
         plots_panel = QtWidgets.QWidget()
@@ -160,6 +213,10 @@ class PointsProcessor(QtWidgets.QMainWindow):
         else:
             self.status_label.setText(f"Video: {os.path.basename(path)}")
 
+        # Update overlay graph if CSV is loaded
+        if self.df_proc is not None:
+            self.update_overlay_graph()
+
         self.show_frame_at(0)
 
     def load_csv(self):
@@ -219,6 +276,13 @@ class PointsProcessor(QtWidgets.QMainWindow):
                 for oid in unique_oids:
                     if int(oid) not in self.object_names:
                         self.object_names[int(oid)] = f"Obj {int(oid)}"
+
+            # Create checkboxes for objects
+            self.create_object_checkboxes()
+
+            # Show and initialize overlay graph
+            self.overlay_canvas.setVisible(True)
+            self.update_overlay_graph()
 
             # Update status
             if self.video_path:
@@ -297,6 +361,9 @@ class PointsProcessor(QtWidgets.QMainWindow):
         self.frame_slider.setValue(self.frame_idx)
         self.frame_display.setText(f"Frame: {self.frame_idx} / {self.frame_count-1}")
 
+        # Update overlay graph
+        self.update_overlay_graph()
+
     def display_frame(self, frame, overlay_mask=None, pnts=None):
         # convert BGR to RGB and display
         disp = frame.copy()
@@ -346,6 +413,145 @@ class PointsProcessor(QtWidgets.QMainWindow):
         self.frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
         self.frame_slider.setValue(self.frame_idx)
         self.frame_display.setText(f"Frame: {self.frame_idx} / {self.frame_count-1}")
+
+        # Update overlay graph
+        self.update_overlay_graph()
+
+    # --------------------------
+    # Overlay graph methods
+    # --------------------------
+    def create_object_checkboxes(self):
+        """Create checkboxes for each object."""
+        # Clear existing checkboxes
+        for cb in self.object_checkboxes.values():
+            cb.setParent(None)
+            cb.deleteLater()
+        self.object_checkboxes.clear()
+
+        if self.df_raw is None:
+            return
+
+        # Get unique object IDs
+        unique_oids = sorted(self.df_raw["ObjectID"].unique())
+
+        for oid in unique_oids:
+            oid_int = int(oid)
+            obj_name = self.object_names.get(oid_int, f"Obj {oid_int}")
+            cb = QtWidgets.QCheckBox(obj_name)
+            cb.setChecked(True)  # All checked by default
+            self.overlay_visible_objects.add(oid_int)
+
+            def make_handler(target_oid):
+                def handler(state):
+                    if state == QtCore.Qt.Checked:
+                        self.overlay_visible_objects.add(target_oid)
+                    else:
+                        self.overlay_visible_objects.discard(target_oid)
+                    self.update_overlay_graph()
+                return handler
+
+            cb.stateChanged.connect(make_handler(oid_int))
+            self.object_checkboxes[oid_int] = cb
+            self.object_checkboxes_layout.addWidget(cb)
+
+        self.object_checkboxes_layout.addStretch()
+
+    def on_overlay_graph_changed(self, index):
+        """Handle overlay graph type dropdown change."""
+        graph_types = {
+            0: "X_smooth",
+            1: "Velocity_smooth",
+            2: "Acceleration_smooth"
+        }
+        self.overlay_graph_type = graph_types.get(index, "X_smooth")
+        self.update_overlay_graph()
+
+    def update_overlay_graph(self):
+        """Update the overlay graph with data up to current frame."""
+        if self.df_proc is None or self.frame_idx < 0:
+            self.overlay_ax.clear()
+            self.overlay_canvas.draw()
+            return
+
+        # Get total frame count from video (or max frame from data if video not loaded)
+        if hasattr(self, 'frame_count') and self.frame_count > 0:
+            max_frame = self.frame_count - 1
+        else:
+            # Use max frame from data if video not loaded
+            max_frame = int(self.df_proc["Frame"].max())
+
+        # Get data up to current frame
+        df_filtered = self.df_proc[self.df_proc["Frame"] <= self.frame_idx].copy()
+
+        # Clear previous plot
+        self.overlay_ax.clear()
+
+        # Get column name and label
+        col_map = {
+            "X_smooth": ("X_smooth", "Smoothed X Position (pixels)"),
+            "Velocity_smooth": ("Velocity_smooth", "Smoothed Velocity (pixels/frame)"),
+            "Acceleration_smooth": ("Acceleration_smooth", "Smoothed Acceleration (pixels/frame^2)")
+        }
+
+        col_name, ylabel = col_map.get(self.overlay_graph_type, ("X_smooth", "Smoothed X Position (pixels)"))
+
+        # Calculate y-axis range from all data (for visible objects only)
+        y_min = float('inf')
+        y_max = float('-inf')
+        for oid, group in self.df_proc.groupby("ObjectID"):
+            oid_int = int(oid)
+            if oid_int in self.overlay_visible_objects:
+                y_vals = group[col_name].values
+                if len(y_vals) > 0:
+                    y_min = min(y_min, y_vals.min())
+                    y_max = max(y_max, y_vals.max())
+
+        # If no visible objects or no data, use default range
+        if y_min == float('inf') or y_max == float('-inf'):
+            y_min = 0
+            y_max = 100
+        else:
+            # Add margin (5% above and below)
+            y_range = y_max - y_min
+            if y_range == 0:
+                y_range = abs(y_max) if y_max != 0 else 100
+            margin = y_range * 0.05
+            y_min = y_min - margin
+            y_max = y_max + margin
+
+        # Plot data for visible objects only (only up to current frame)
+        for oid, group in df_filtered.groupby("ObjectID"):
+            oid_int = int(oid)
+            if oid_int in self.overlay_visible_objects:
+                obj_name = self.object_names.get(oid_int, f"Obj {oid_int}")
+                self.overlay_ax.plot(group["Frame"], group[col_name],
+                                   linestyle='-', marker='.', markersize=4,
+                                   label=obj_name, linewidth=2)
+
+        # Set x-axis limits to show full frame range (fixed)
+        self.overlay_ax.set_xlim(0, max_frame)
+
+        # Set y-axis limits to show full data range with margin (fixed)
+        self.overlay_ax.set_ylim(y_min, y_max)
+
+        # Set labels and styling
+        self.overlay_ax.set_xlabel("Frame", color='white', fontsize=9)
+        self.overlay_ax.set_ylabel(ylabel, color='white', fontsize=9)
+        self.overlay_ax.spines['top'].set_visible(False)
+        self.overlay_ax.spines['right'].set_visible(False)
+        self.overlay_ax.spines['bottom'].set_color('white')
+        self.overlay_ax.spines['left'].set_color('white')
+        self.overlay_ax.tick_params(colors='white', labelsize=8)
+        self.overlay_ax.grid(True, linestyle='--', alpha=0.3, color='white')
+
+        # Add legend if there are visible objects
+        if self.overlay_visible_objects:
+            self.overlay_ax.legend(loc="upper right", fontsize='small',
+                                 facecolor='black', edgecolor='white',
+                                 labelcolor='white', framealpha=0.7)
+
+        self.overlay_fig.tight_layout(pad=0.5)
+        self.overlay_canvas.draw()
 
     # --------------------------
     # Slider seek
